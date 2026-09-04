@@ -1,0 +1,132 @@
+from unittest.mock import patch
+
+import numpy as np
+import pytest
+from scipy.spatial.transform import Rotation
+
+from policies.vlanext_policy.client import (
+    DROID_TCP_IN_BASE_POS,
+    DROID_TCP_IN_BASE_QUAT_WXYZ,
+    VLANeXtDroidEEFClient,
+    droid_actions_to_robolab,
+    resize_image,
+    robolab_pose_to_droid,
+)
+
+
+def test_droid_eef_action_is_converted_to_base_link_absolute_ik() -> None:
+    offset_xyzw = DROID_TCP_IN_BASE_QUAT_WXYZ[[1, 2, 3, 0]]
+    euler = Rotation.from_quat(offset_xyzw).as_euler("xyz")
+    droid_action = np.array([[0.4, -0.2, 0.3, *euler, 0.7]], dtype=np.float32)
+
+    action = droid_actions_to_robolab(droid_action)[0]
+
+    np.testing.assert_allclose(
+        action[:3], droid_action[0, :3] - DROID_TCP_IN_BASE_POS, atol=1e-6
+    )
+    np.testing.assert_allclose(action[3:7], [1.0, 0.0, 0.0, 0.0], atol=1e-6)
+    assert action[7] == 1.0
+
+
+def test_droid_and_robolab_pose_transforms_are_inverses() -> None:
+    base_position = np.array([0.325, 0.117, 0.500])
+    base_rotation = Rotation.from_euler("xyz", [-0.925, 1.350, -0.908])
+    base_xyzw = base_rotation.as_quat()
+    base_wxyz = base_xyzw[[3, 0, 1, 2]]
+
+    droid_pose = robolab_pose_to_droid(base_position, base_wxyz)
+    droid_action = np.concatenate([droid_pose, [0.0]])[None]
+    recovered = droid_actions_to_robolab(droid_action)[0]
+
+    np.testing.assert_allclose(recovered[:3], base_position, atol=1e-6)
+    recovered_rotation = _rotation_from_wxyz(recovered[3:7])
+    rotation_error = (recovered_rotation.inv() * base_rotation).as_rotvec()
+    np.testing.assert_allclose(rotation_error, np.zeros(3), atol=1e-6)
+
+
+def _rotation_from_wxyz(quaternion: np.ndarray) -> Rotation:
+    return Rotation.from_quat(quaternion[[1, 2, 3, 0]])
+
+
+def test_resize_image_uses_server_shape_without_padding() -> None:
+    image = np.zeros((10, 20, 3), dtype=np.uint8)
+    image[:, :10, 0] = 255
+    resized = resize_image(image, [8, 12])
+    assert resized.shape == (8, 12, 3)
+    assert resized[:, 0, 0].mean() > resized[:, -1, 0].mean()
+
+
+def test_integer_resize_uses_target_width_and_preserves_aspect_ratio() -> None:
+    image = np.zeros((10, 20, 3), dtype=np.uint8)
+
+    resized = resize_image(image, 10)
+
+    assert resized.shape == (5, 10, 3)
+
+
+@pytest.mark.parametrize("image_size", [True, 0, -1, [0, 8], [8, 0], [1, 2, 3], "8"])
+def test_resize_image_rejects_invalid_metadata(image_size) -> None:
+    with pytest.raises(ValueError, match="image_size"):
+        resize_image(np.zeros((10, 20, 3), dtype=np.uint8), image_size)
+
+
+class _FakeServerClient:
+    def __init__(self, *_args, **_kwargs) -> None:
+        self.requests = []
+        self.metadata = {
+            "action_representation": "droid_absolute_eef_xyz_euler_xyz_gripper",
+            "action_horizon": 2,
+            "action_dim": 7,
+            "history_len": 2,
+            "image_size": 8,
+            "input_modality": "video",
+            "view_mode": "multi",
+        }
+
+    def get_server_metadata(self) -> dict:
+        return self.metadata
+
+    def infer(self, request: dict) -> dict:
+        self.requests.append(request)
+        actions = np.zeros((2, 7), dtype=np.float32)
+        actions[:, :3] = [0.4, 0.0, 0.3]
+        actions[:, 6] = [0.2, 0.8]
+        return {"actions": actions, "normalized_actions": actions.copy()}
+
+
+def _observation() -> dict:
+    return {
+        "image_obs": {
+            "over_shoulder_left_camera": np.zeros((1, 12, 16, 3), dtype=np.uint8),
+            "wrist_cam": np.zeros((1, 12, 16, 3), dtype=np.uint8),
+        },
+        "proprio_obs": {
+            "ee_pos": np.array([[0.4, 0.0, 0.3]], dtype=np.float32),
+            "ee_quat": np.array([[1.0, 0.0, 0.0, 0.0]], dtype=np.float32),
+            "gripper_pos": np.array([[0.0]], dtype=np.float32),
+        },
+    }
+
+
+def test_client_uses_metadata_and_tracks_per_step_histories() -> None:
+    with patch(
+        "policies.vlanext_policy.client.websocket_client_policy.WebsocketClientPolicy",
+        _FakeServerClient,
+    ):
+        client = VLANeXtDroidEEFClient(open_loop_horizon=2)
+
+    first = client.infer(_observation(), "pick up the object")
+    second = client.infer(_observation(), "pick up the object")
+    third = client.infer(_observation(), "pick up the object")
+
+    assert first["action"].shape == (8,)
+    assert first["action"][-1] == 0.0
+    assert second["action"][-1] == 1.0
+    assert third["action"][-1] == 0.0
+    assert len(client.client.requests) == 2
+    first_request, second_request = client.client.requests
+    assert first_request["observation/exterior_image_1_left"].shape == (1, 6, 8, 3)
+    assert second_request["observation/exterior_image_1_left"].shape == (2, 6, 8, 3)
+    assert second_request["observation/state_history"].shape == (2, 7)
+    assert "observation/action_history" not in first_request
+    assert "observation/action_history" not in second_request
