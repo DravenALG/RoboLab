@@ -1,4 +1,4 @@
-"""RoboLab client for a VLANeXt DROID absolute-EEF policy server."""
+"""RoboLab client for VLANeXt DROID Cartesian and joint-position policies."""
 
 from __future__ import annotations
 
@@ -16,6 +16,17 @@ from scipy.spatial.transform import Rotation
 from robolab.eval.base_client import InferenceClient
 
 logger = logging.getLogger(__name__)
+
+ACTION_REPRESENTATIONS = {
+    "cartesian": "droid_absolute_eef_xyz_euler_xyz_gripper",
+    "joint": "droid_absolute_joint_position_gripper",
+}
+MODEL_ACTION_REPRESENTATIONS = {
+    "cartesian": "droid_absolute_eef_xyz_euler_xyz_gripper",
+    "joint": "droid_delta_joint_position_gripper",
+}
+ACTION_DIMS = {"cartesian": 7, "joint": 8}
+ACTION_NORMALIZATIONS = {"quantile_01_99", "min_max"}
 
 # DROID Cartesian actions target a TCP that differs from RoboLab's controlled
 # ``base_link``.  The transform is expressed in the base_link frame.
@@ -83,8 +94,8 @@ def resize_image(image: np.ndarray, image_size: int | tuple[int, int] | list[int
     return np.asarray(Image.fromarray(image).resize((width, height), Image.Resampling.LANCZOS))
 
 
-class VLANeXtDroidEEFClient(InferenceClient):
-    """Stateful OpenPI-protocol client for VLANeXt's DROID action space."""
+class VLANeXtDroidClient(InferenceClient):
+    """Stateful OpenPI-protocol client for VLANeXt's DROID action spaces."""
 
     def __init__(
         self,
@@ -92,8 +103,12 @@ class VLANeXtDroidEEFClient(InferenceClient):
         remote_port: int = 8000,
         open_loop_horizon: int | None = None,
         remote_uri: str | None = None,
+        action_mode: str = "joint",
     ) -> None:
         super().__init__()
+        if action_mode not in ACTION_REPRESENTATIONS:
+            raise ValueError(f"Unsupported action mode: {action_mode!r}")
+        self.action_mode = action_mode
         self._remote_host = remote_host
         self._remote_port = remote_port
         self._remote_uri = remote_uri
@@ -121,18 +136,40 @@ class VLANeXtDroidEEFClient(InferenceClient):
         return websocket_client_policy.WebsocketClientPolicy(self._remote_host, self._remote_port)
 
     def _configure_from_metadata(self, requested_horizon: int | None) -> None:
-        expected = "droid_absolute_eef_xyz_euler_xyz_gripper"
+        expected = ACTION_REPRESENTATIONS[self.action_mode]
         representation = self.metadata.get("action_representation")
         if representation != expected:
             raise ValueError(f"Server action representation is {representation!r}, expected {expected!r}")
+        model_representation = self.metadata.get("model_action_representation")
+        expected_model_representation = MODEL_ACTION_REPRESENTATIONS[self.action_mode]
+        if model_representation != expected_model_representation:
+            raise ValueError(
+                f"Server model action representation is {model_representation!r}, "
+                f"expected {expected_model_representation!r}"
+            )
+        self.action_normalization = self.metadata.get("action_normalization")
+        if self.action_normalization not in ACTION_NORMALIZATIONS:
+            raise ValueError(
+                f"Unsupported server action normalization: {self.action_normalization!r}"
+            )
+
+        server_mode = self.metadata.get("action_mode")
+        if server_mode is not None and server_mode != self.action_mode:
+            raise ValueError(
+                f"Server action mode is {server_mode!r}, expected {self.action_mode!r}"
+            )
 
         self.action_horizon = int(self.metadata["action_horizon"])
         self.history_len = int(self.metadata["history_len"])
         self.image_size = self.metadata.get("image_size")
         self.input_modality = self.metadata.get("input_modality", "image")
         self.view_mode = self.metadata.get("view_mode", "single")
-        if int(self.metadata.get("action_dim", 0)) != 7:
-            raise ValueError(f"Server action_dim must be 7, got {self.metadata.get('action_dim')}")
+        self.action_dim = ACTION_DIMS[self.action_mode]
+        if int(self.metadata.get("action_dim", 0)) != self.action_dim:
+            raise ValueError(
+                f"Server action_dim must be {self.action_dim} for {self.action_mode}, "
+                f"got {self.metadata.get('action_dim')}"
+            )
 
         if self.input_modality not in {"image", "video"}:
             raise ValueError(f"Unsupported input modality: {self.input_modality!r}")
@@ -173,14 +210,17 @@ class VLANeXtDroidEEFClient(InferenceClient):
         image = self._to_numpy(raw_obs["image_obs"]["over_shoulder_left_camera"], env_id)
         wrist = self._to_numpy(raw_obs["image_obs"]["wrist_cam"], env_id)
         proprio = raw_obs["proprio_obs"]
-        base_position = self._to_numpy(proprio["ee_pos"], env_id).reshape(3)
-        base_quaternion = self._to_numpy(proprio["ee_quat"], env_id).reshape(4)
         gripper = float(self._to_numpy(proprio["gripper_pos"], env_id).reshape(-1)[0])
-        droid_pose = robolab_pose_to_droid(base_position, base_quaternion)
+        if self.action_mode == "joint":
+            arm_state = self._to_numpy(proprio["arm_joint_pos"], env_id).reshape(7)
+        else:
+            base_position = self._to_numpy(proprio["ee_pos"], env_id).reshape(3)
+            base_quaternion = self._to_numpy(proprio["ee_quat"], env_id).reshape(4)
+            arm_state = robolab_pose_to_droid(base_position, base_quaternion)
 
         image = resize_image(image, self.image_size)
         wrist = resize_image(wrist, self.image_size)
-        state = np.concatenate([droid_pose, [np.clip(gripper, 0.0, 1.0)]]).astype(
+        state = np.concatenate([arm_state, [np.clip(gripper, 0.0, 1.0)]]).astype(
             np.float32
         )
         self._history(self._state_history, env_id).append(state)
@@ -235,16 +275,21 @@ class VLANeXtDroidEEFClient(InferenceClient):
 
     def _unpack_response(self, response: dict) -> np.ndarray:
         actions = np.asarray(response["actions"], dtype=np.float32)
-        if actions.shape != (self.action_horizon, 7):
+        expected_shape = (self.action_horizon, self.action_dim)
+        if actions.shape != expected_shape:
             raise ValueError(
-                f"Server returned actions {actions.shape}, expected ({self.action_horizon}, 7)"
+                f"Server returned actions {actions.shape}, expected {expected_shape}"
             )
         if not np.all(np.isfinite(actions)):
             raise ValueError("Server returned NaN or infinity")
         return actions
 
     def _postprocess_chunk(self, chunk: np.ndarray) -> np.ndarray:
-        return droid_actions_to_robolab(chunk)
+        if self.action_mode == "cartesian":
+            return droid_actions_to_robolab(chunk)
+        chunk = chunk.copy()
+        chunk[:, -1] = (chunk[:, -1] > 0.5).astype(chunk.dtype)
+        return chunk
 
     def _build_visualization(self, extracted_obs: dict) -> np.ndarray:
         if self.view_mode == "multi":

@@ -1,4 +1,4 @@
-"""Evaluate a VLANeXt DROID absolute-EEF policy in RoboLab."""
+"""Evaluate a VLANeXt DROID Cartesian or joint-position policy in RoboLab."""
 
 import argparse
 import sys
@@ -13,6 +13,13 @@ parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument("--remote-host", "--remote_host", default="localhost")
 parser.add_argument("--remote-port", "--remote_port", default=8000, type=int)
 parser.add_argument("--remote-uri", "--remote_uri", default=None)
+parser.add_argument(
+    "--action-mode",
+    "--action_mode",
+    choices=("cartesian", "joint"),
+    default="joint",
+    help="DROID control space; must match the served checkpoint.",
+)
 parser.add_argument(
     "--open-loop-horizon",
     "--open_loop_horizon",
@@ -31,20 +38,29 @@ args_cli.enable_cameras = True
 app_launcher = AppLauncher(args_cli)
 simulation_app = app_launcher.app
 
-from policies.vlanext_policy.client import VLANeXtDroidEEFClient  # noqa: E402
-from robolab.registrations.droid.auto_env_registrations_abs_ik import (  # noqa: E402
-    auto_register_droid_abs_ik_envs,
-)
+from policies.vlanext_policy.client import VLANeXtDroidClient  # noqa: E402
 
-auto_register_droid_abs_ik_envs(task_dirs=args_cli.task_dirs, task=args_cli.task)
+if args_cli.action_mode == "joint":
+    from robolab.registrations.droid.auto_env_registrations_jointpos import (  # noqa: E402
+        auto_register_droid_envs,
+    )
+
+    auto_register_droid_envs(task_dirs=args_cli.task_dirs, task=args_cli.task)
+else:
+    from robolab.registrations.droid.auto_env_registrations_abs_ik import (  # noqa: E402
+        auto_register_droid_abs_ik_envs,
+    )
+
+    auto_register_droid_abs_ik_envs(task_dirs=args_cli.task_dirs, task=args_cli.task)
 
 
-def make_client(args: argparse.Namespace) -> VLANeXtDroidEEFClient:
-    return VLANeXtDroidEEFClient(
+def make_client(args: argparse.Namespace) -> VLANeXtDroidClient:
+    return VLANeXtDroidClient(
         remote_host=args.remote_host,
         remote_port=args.remote_port,
         remote_uri=args.remote_uri,
         open_loop_horizon=args.open_loop_horizon,
+        action_mode=args.action_mode,
     )
 
 

@@ -7,7 +7,7 @@ from scipy.spatial.transform import Rotation
 from policies.vlanext_policy.client import (
     DROID_TCP_IN_BASE_POS,
     DROID_TCP_IN_BASE_QUAT_WXYZ,
-    VLANeXtDroidEEFClient,
+    VLANeXtDroidClient,
     droid_actions_to_robolab,
     resize_image,
     robolab_pose_to_droid,
@@ -75,6 +75,8 @@ class _FakeServerClient:
         self.requests = []
         self.metadata = {
             "action_representation": "droid_absolute_eef_xyz_euler_xyz_gripper",
+            "model_action_representation": "droid_absolute_eef_xyz_euler_xyz_gripper",
+            "action_normalization": "quantile_01_99",
             "action_horizon": 2,
             "action_dim": 7,
             "history_len": 2,
@@ -113,7 +115,7 @@ def test_client_uses_metadata_and_tracks_per_step_histories() -> None:
         "policies.vlanext_policy.client.websocket_client_policy.WebsocketClientPolicy",
         _FakeServerClient,
     ):
-        client = VLANeXtDroidEEFClient(open_loop_horizon=2)
+        client = VLANeXtDroidClient(action_mode="cartesian", open_loop_horizon=2)
 
     first = client.infer(_observation(), "pick up the object")
     second = client.infer(_observation(), "pick up the object")
@@ -123,10 +125,57 @@ def test_client_uses_metadata_and_tracks_per_step_histories() -> None:
     assert first["action"][-1] == 0.0
     assert second["action"][-1] == 1.0
     assert third["action"][-1] == 0.0
-    assert len(client.client.requests) == 2
-    first_request, second_request = client.client.requests
+    assert len(client._remote_policy.requests) == 2
+    first_request, second_request = client._remote_policy.requests
     assert first_request["observation/exterior_image_1_left"].shape == (1, 6, 8, 3)
     assert second_request["observation/exterior_image_1_left"].shape == (2, 6, 8, 3)
     assert second_request["observation/state_history"].shape == (2, 7)
     assert "observation/action_history" not in first_request
     assert "observation/action_history" not in second_request
+
+
+class _FakeJointServerClient(_FakeServerClient):
+    def __init__(self, *_args, **_kwargs) -> None:
+        super().__init__()
+        self.metadata.update(
+            action_mode="joint",
+            action_representation="droid_absolute_joint_position_gripper",
+            model_action_representation="droid_delta_joint_position_gripper",
+            action_dim=8,
+        )
+
+    def infer(self, request: dict) -> dict:
+        self.requests.append(request)
+        actions = np.tile(np.arange(8, dtype=np.float32), (2, 1))
+        actions[:, -1] = [0.2, 0.8]
+        return {"actions": actions, "normalized_actions": actions.copy()}
+
+
+def test_joint_client_packs_joint_state_and_executes_joint_targets() -> None:
+    with patch(
+        "policies.vlanext_policy.client.websocket_client_policy.WebsocketClientPolicy",
+        _FakeJointServerClient,
+    ):
+        client = VLANeXtDroidClient(open_loop_horizon=2)
+
+    assert client.action_mode == "joint"
+    observation = _observation()
+    observation["proprio_obs"]["arm_joint_pos"] = np.arange(7, dtype=np.float32)[None]
+    first = client.infer(observation, "pick up the object")
+    second = client.infer(observation, "pick up the object")
+
+    np.testing.assert_array_equal(first["action"], [0, 1, 2, 3, 4, 5, 6, 0])
+    np.testing.assert_array_equal(second["action"], [0, 1, 2, 3, 4, 5, 6, 1])
+    request = client._remote_policy.requests[0]
+    np.testing.assert_array_equal(
+        request["observation/state_history"][0],
+        [0, 1, 2, 3, 4, 5, 6, 0],
+    )
+
+
+def test_client_rejects_action_mode_mismatch() -> None:
+    with patch(
+        "policies.vlanext_policy.client.websocket_client_policy.WebsocketClientPolicy",
+        _FakeJointServerClient,
+    ), pytest.raises(ValueError, match="action representation"):
+        VLANeXtDroidClient(action_mode="cartesian")
