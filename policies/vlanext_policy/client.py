@@ -94,6 +94,22 @@ def resize_image(image: np.ndarray, image_size: int | tuple[int, int] | list[int
     return np.asarray(Image.fromarray(image).resize((width, height), Image.Resampling.LANCZOS))
 
 
+def center_crop_image(image: np.ndarray, ratio: float) -> np.ndarray:
+    """Keep a centered fraction of each dimension, then restore the input size."""
+    if not 0.0 < ratio <= 1.0:
+        raise ValueError(f"center_crop_ratio must be in (0, 1], got {ratio}")
+    if ratio == 1.0:
+        return image
+    height, width = image.shape[:2]
+    crop_height = max(1, round(height * ratio))
+    crop_width = max(1, round(width * ratio))
+    top = (height - crop_height) // 2
+    left = (width - crop_width) // 2
+    cropped = image[top : top + crop_height, left : left + crop_width]
+    # Match the bilinear resized crop used by the training collator.
+    return np.asarray(Image.fromarray(cropped).resize((width, height), Image.Resampling.BILINEAR))
+
+
 class VLANeXtDroidClient(InferenceClient):
     """Stateful OpenPI-protocol client for VLANeXt's DROID action spaces."""
 
@@ -104,11 +120,23 @@ class VLANeXtDroidClient(InferenceClient):
         open_loop_horizon: int | None = None,
         remote_uri: str | None = None,
         action_mode: str = "joint",
+        center_crop_ratio: float = 1.0,
+        inference_batch_size: int = 1,
+        gripper_threshold: float = 0.5,
     ) -> None:
         super().__init__()
         if action_mode not in ACTION_REPRESENTATIONS:
             raise ValueError(f"Unsupported action mode: {action_mode!r}")
         self.action_mode = action_mode
+        if not 0.0 < center_crop_ratio <= 1.0:
+            raise ValueError(f"center_crop_ratio must be in (0, 1], got {center_crop_ratio}")
+        self.center_crop_ratio = float(center_crop_ratio)
+        if inference_batch_size < 1:
+            raise ValueError("inference_batch_size must be positive")
+        if not 0.0 < gripper_threshold < 1.0:
+            raise ValueError("gripper_threshold must be in (0, 1)")
+        self.inference_batch_size = int(inference_batch_size)
+        self.gripper_threshold = float(gripper_threshold)
         self._remote_host = remote_host
         self._remote_port = remote_port
         self._remote_uri = remote_uri
@@ -117,11 +145,16 @@ class VLANeXtDroidClient(InferenceClient):
         print(f"[{self.__class__.__name__}] Waiting for VLANeXt at {self._display}...")
         self._remote_policy = self._connect()
         self.metadata = self._remote_policy.get_server_metadata()
+        if self.inference_batch_size > 1 and not self.metadata.get("supports_batch_inference", False):
+            raise ValueError("This server does not support batched inference; use inference_batch_size=1")
         self._configure_from_metadata(open_loop_horizon)
         self._reset_histories()
         print(
             f"[{self.__class__.__name__}] Connected: horizon={self.action_horizon}, "
-            f"history={self.history_len}, modality={self.input_modality}, views={self.view_mode}."
+            f"history={self.history_len}, modality={self.input_modality}, views={self.view_mode}, "
+            f"center_crop_ratio={self.center_crop_ratio}, batch_size={self.inference_batch_size}, "
+            f"open_loop_horizon={self.open_loop_horizon}, gripper_threshold={self.gripper_threshold}, "
+            f"denoising_steps={self.metadata.get('num_inference_timesteps', 'checkpoint default')}."
         )
 
     def _connect(self) -> websocket_client_policy.WebsocketClientPolicy:
@@ -220,6 +253,8 @@ class VLANeXtDroidClient(InferenceClient):
 
         image = resize_image(image, self.image_size)
         wrist = resize_image(wrist, self.image_size)
+        image = center_crop_image(image, self.center_crop_ratio)
+        wrist = center_crop_image(wrist, self.center_crop_ratio)
         state = np.concatenate([arm_state, [np.clip(gripper, 0.0, 1.0)]]).astype(
             np.float32
         )
@@ -247,6 +282,21 @@ class VLANeXtDroidClient(InferenceClient):
 
     def _query_server(self, request: dict) -> dict:
         return self._infer_with_retry(request)
+
+    def infer_batch(self, obs: Any, instruction: str, *, env_ids: list[int]) -> dict[int, dict]:
+        if self.inference_batch_size == 1:
+            return super().infer_batch(obs, instruction, env_ids=env_ids)
+        extracted = {eid: self._extract_observation(obs, env_id=eid) for eid in env_ids}
+        refresh_ids = [eid for eid in env_ids if self._needs_refresh(eid)]
+        for start in range(0, len(refresh_ids), self.inference_batch_size):
+            batch_ids = refresh_ids[start : start + self.inference_batch_size]
+            response = self._query_server({"requests": [self._pack_request(extracted[eid], instruction) for eid in batch_ids]})
+            responses = response.get("responses", [])
+            if len(responses) != len(batch_ids):
+                raise ValueError("Server returned an incorrect number of batched responses")
+            for eid, item in zip(batch_ids, responses):
+                self._set_chunk(eid, self._postprocess_chunk(self._unpack_response(item)))
+        return {eid: {"action": self._next_action(eid), "viz": self._build_visualization(extracted[eid])} for eid in env_ids}
 
     def _infer_with_retry(self, request: dict, max_retries: int = 3) -> dict:
         import websockets.exceptions
@@ -288,7 +338,7 @@ class VLANeXtDroidClient(InferenceClient):
         if self.action_mode == "cartesian":
             return droid_actions_to_robolab(chunk)
         chunk = chunk.copy()
-        chunk[:, -1] = (chunk[:, -1] > 0.5).astype(chunk.dtype)
+        chunk[:, -1] = (chunk[:, -1] > self.gripper_threshold).astype(chunk.dtype)
         return chunk
 
     def _build_visualization(self, extracted_obs: dict) -> np.ndarray:

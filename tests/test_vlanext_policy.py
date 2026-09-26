@@ -134,6 +134,35 @@ def test_client_uses_metadata_and_tracks_per_step_histories() -> None:
     assert "observation/action_history" not in second_request
 
 
+@pytest.mark.parametrize("crop_ratio", [1.0, 0.95])
+def test_client_crop_preserves_shape_and_removes_borders_in_both_views(crop_ratio) -> None:
+    with patch(
+        "policies.vlanext_policy.client.websocket_client_policy.WebsocketClientPolicy",
+        _FakeServerClient,
+    ):
+        client = VLANeXtDroidClient(action_mode="cartesian", center_crop_ratio=crop_ratio)
+    client.image_size = None
+    observation = _observation()
+    for image_key in ("over_shoulder_left_camera", "wrist_cam"):
+        image = np.zeros((1, 80, 160, 3), dtype=np.uint8)
+        image[:, :2] = 255
+        image[:, -2:] = 255
+        image[:, :, :4] = 255
+        image[:, :, -4:] = 255
+        observation["image_obs"][image_key] = image
+
+    client.infer(observation, "pick up the object")
+    request = client._remote_policy.requests[0]
+    for key in ("observation/exterior_image_1_left", "observation/wrist_image_left"):
+        images = request[key]
+        assert images.shape == (1, 80, 160, 3)
+        assert images.dtype == np.uint8
+        if crop_ratio == 1.0:
+            np.testing.assert_array_equal(images, image)
+        else:
+            assert not images.any()
+
+
 class _FakeJointServerClient(_FakeServerClient):
     def __init__(self, *_args, **_kwargs) -> None:
         super().__init__()
@@ -179,3 +208,36 @@ def test_client_rejects_action_mode_mismatch() -> None:
         _FakeJointServerClient,
     ), pytest.raises(ValueError, match="action representation"):
         VLANeXtDroidClient(action_mode="cartesian")
+
+
+def test_batched_client_keeps_environment_chunks_and_refreshes_only_when_needed() -> None:
+    class BatchServer(_FakeJointServerClient):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.metadata["supports_batch_inference"] = True
+
+        def infer(self, request):
+            self.requests.append(request)
+            responses = []
+            for item in request["requests"]:
+                state = item["observation/state_history"][-1]
+                actions = np.tile(state, (2, 1))
+                actions[:, -1] = 0.4
+                responses.append({"actions": actions})
+            return {"responses": responses}
+
+    with patch("policies.vlanext_policy.client.websocket_client_policy.WebsocketClientPolicy", BatchServer):
+        client = VLANeXtDroidClient(inference_batch_size=2, gripper_threshold=0.3)
+    observation = _observation()
+    for group in observation.values():
+        for key, value in group.items():
+            group[key] = np.repeat(value, 3, axis=0)
+    observation["proprio_obs"]["arm_joint_pos"] = np.tile(np.arange(3)[:, None], (1, 7)).astype(np.float32)
+    first = client.infer_batch(observation, "move", env_ids=[2, 0])
+    client.infer_batch(observation, "move", env_ids=[0])
+    third = client.infer_batch(observation, "move", env_ids=[2, 0])
+    assert [len(r["requests"]) for r in client._remote_policy.requests] == [2, 1]
+    for result in (first, third):
+        for env_id in (2, 0):
+            np.testing.assert_array_equal(result[env_id]["action"][:7], env_id)
+            assert result[env_id]["action"][-1] == 1.0
