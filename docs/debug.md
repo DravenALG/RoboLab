@@ -174,6 +174,39 @@ Minimal smoke test that IsaacLab and IsaacSim launch correctly:
 uv run pytest tests/test_isaaclab.py -v
 ```
 
+### Pytest exit codes and Isaac Sim shutdown
+
+With Isaac Sim 5.0.0 / IsaacLab 2.2.0, two separate shutdown problems can occur:
+
+- Kit normally intercepts `sys.exit()` and calls `post_quit(status)`. An argparse
+  test that catches the expected `SystemExit(2)` can therefore leave Kit with
+  exit code 2 even though pytest reports that all tests passed.
+- Disabling `fast_shutdown` can cause a segmentation fault after `close()`
+  returns, during Python garbage collection. A minimal launch/close reproduction
+  on this stack faults in `omni.kit.ui.editor_menu.EditorMenu.__del__` while
+  releasing its native extension subscriptions, after plugins have been unloaded.
+  This also reproduces without loading a RoboLab task.
+
+The test suite keeps `fast_shutdown=True` and passes
+`--/app/python/interceptSysExit=false` to Kit at startup. Its session-finish hook
+waits for pytest's terminal and JUnit reports, flushes output, then forwards
+`session.exitstatus` to Kit before closing the app. Expected Python exceptions
+stay under pytest's control, and failing tests still produce a nonzero exit code.
+Each test must still close its environments and recorders before session shutdown.
+
+Run the regression checks from the RoboLab directory:
+
+```bash
+python -m pytest tests/test_runner_args.py tests/test_episode_length.py \
+  -q --junitxml=/tmp/robolab-tests.xml
+```
+
+Keep each Isaac Sim test session in its own process: fast shutdown terminates
+that process inside `close()`. Do not disable fast shutdown just to make
+`pytest.main()` return to an embedding Python caller; run pytest as a subprocess
+instead. The test configuration avoids the observed native unload crash; it does
+not patch Isaac Sim's native plugin teardown.
+
 ### Inspect HDF5 data
 
 View the HDF5 file structure with `h5glance` (install separately with `pip install h5glance`):

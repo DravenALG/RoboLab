@@ -10,6 +10,7 @@ termination checking.
 
 import json
 import logging
+import math
 import os
 
 import carb
@@ -86,6 +87,7 @@ def create_env(scene: str | ManagerBasedEnvCfg,
                policy=None,
                renderer="realtime",
                rendering_mode=None,
+               episode_length_s: float | None = None,
     ):
     """
     Creates and initializes a gym environment for the specified scene. Supported types: str, ManagerBasedEnvCfg.
@@ -137,13 +139,20 @@ def create_env(scene: str | ManagerBasedEnvCfg,
             "pathtracing" (PathTracing). Default preserves IsaacLab behavior.
         rendering_mode: Realtime quality preset ("performance"/"balanced"/"quality")
             or None to leave IsaacLab's default ("balanced").
+        episode_length_s: Maximum simulated seconds per episode. Must be finite
+            and positive; None preserves the task's configured duration.
 
     Raises:
-        ValueError: If the scene type is not supported or environment creation fails
+        ValueError: If episode_length_s is invalid, the scene type is not
+            supported, or environment creation fails.
 
     Returns:
         tuple: (env, env_cfg) - The created environment instance and its configuration
     """
+    if episode_length_s is not None:
+        if not math.isfinite(episode_length_s) or episode_length_s <= 0:
+            raise ValueError("episode_length_s must be finite and positive")
+
     env = None
 
     if isinstance(scene, str):
@@ -164,6 +173,9 @@ def create_env(scene: str | ManagerBasedEnvCfg,
                 eye=eye,
                 lookat=lookat,
             )
+
+            if episode_length_s is not None:
+                env_cfg.episode_length_s = episode_length_s
 
             env_cfg._instruction_variants = env_cfg.instruction
             env_cfg.instruction = resolve_instruction(env_cfg.instruction, instruction_type)
@@ -197,6 +209,9 @@ def create_env(scene: str | ManagerBasedEnvCfg,
         # reset the rtx sensors carb setting to False
         carb.settings.get_settings().set_bool("/isaaclab/render/rtx_sensors", False)
         env_cfg = scene
+
+        if episode_length_s is not None:
+            env_cfg.episode_length_s = episode_length_s
 
         env_cfg._instruction_variants = env_cfg.instruction
         env_cfg.instruction = resolve_instruction(env_cfg.instruction, instruction_type)

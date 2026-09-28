@@ -23,6 +23,7 @@ the simulation app.
 from __future__ import annotations
 
 import argparse
+import math
 from typing import TYPE_CHECKING, Callable
 
 from robolab.constants import DEFAULT_TASK_SUBFOLDERS
@@ -42,10 +43,21 @@ def _unit_interval(s: str) -> float:
     return v
 
 
+def _positive_seconds(s: str) -> float:
+    v = float(s)
+    if not math.isfinite(v) or v <= 0:
+        raise argparse.ArgumentTypeError(f"--episode-length-s must be finite and positive, got {s}")
+    return v
+
+
 def add_common_eval_args(parser: argparse.ArgumentParser) -> None:
     """Add the shared eval flags. Call this once per runner script."""
     parser.add_argument("--num-envs", "--num_envs", type=int, default=1,
                         help="Number of environments to spawn.")
+    parser.add_argument("--episode-length-s", "--episode_length_s", type=_positive_seconds,
+                        default=None, metavar="SECONDS",
+                        help="Override the maximum simulated seconds per episode for all selected tasks; "
+                             "defaults to each task's configured duration.")
     parser.add_argument("--task", nargs="+", default=None,
                         help="List of tasks to evaluate on.")
     parser.add_argument("--tag", nargs="+", default=None,
@@ -209,6 +221,7 @@ def run_evaluation(
             policy=policy,
             renderer=args.renderer,
             rendering_mode=args.rendering_type,
+            episode_length_s=args.episode_length_s,
         )
 
         if robolab.constants.ENABLE_SUBTASK_PROGRESS_CHECKING and getattr(env_cfg, "subtasks", None) is None:

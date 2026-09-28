@@ -10,6 +10,7 @@ EULA so a fresh install works headless without any prompts.
 """
 
 import os
+import sys
 
 # Accept the Omniverse EULA non-interactively. Must be set before any
 # isaaclab import. setdefault → user can still override.
@@ -25,6 +26,11 @@ from isaaclab.app import AppLauncher  # noqa: E402
 _launcher = AppLauncher(
     headless=True,
     enable_cameras=True,
+    # Full plugin unload in Isaac Sim 5.0 leaves native UI subscriptions alive
+    # until Python GC, where EditorMenu.__del__ can segfault. Keep Kit's default
+    # fast shutdown, but let pytest own SystemExit and the final process status.
+    fast_shutdown=True,
+    kit_args="--/app/python/interceptSysExit=false",
     carb_settings={
         "/log/level": "warn",
         "/log/outputStreamLevel": "warn",
@@ -62,9 +68,14 @@ def env_name_arg(request):
     return request.config.getoption("--env-name")
 
 
+@pytest.hookimpl(hookwrapper=True, tryfirst=True)
 def pytest_sessionfinish(session, exitstatus):
-    """Close the Isaac Sim app cleanly so the pytest process exits 0."""
-    try:
-        simulation_app.close()
-    except Exception:
-        pass
+    """Write pytest reports before Kit exits, preserving success and failure."""
+    outcome = yield
+    outcome.get_result()
+    # Fast shutdown exits from inside close(), so run this after all other
+    # sessionfinish hooks (including terminal/JUnit reporting), and flush first.
+    sys.stdout.flush()
+    sys.stderr.flush()
+    simulation_app.app.post_quit(int(session.exitstatus))
+    simulation_app.close()
