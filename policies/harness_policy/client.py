@@ -17,9 +17,11 @@ ACTION_REPRESENTATION = "robolab_base_link_absolute_xyz_quat_wxyz_gripper"
 
 
 def validate_eval_args(args) -> None:
-    """Keep v1 evaluation single-attempt, with normal benchmark scoring."""
-    if args.num_envs != 1 or args.num_runs != 1:
-        raise ValueError("The harness requires --num-envs 1 and --num-runs 1")
+    """Evaluate a fixed number of independent, sequential runs with normal scoring."""
+    if args.num_envs != 1:
+        raise ValueError("The harness requires --num-envs 1")
+    if isinstance(args.num_runs, bool) or not isinstance(args.num_runs, int) or args.num_runs < 1:
+        raise ValueError("The harness requires a positive integer for --num-runs")
     if args.num_episodes_adaptive is not None:
         raise ValueError("Adaptive additional episodes are disabled for the harness")
     if args.enable_gt_state:
@@ -31,7 +33,7 @@ def validate_eval_args(args) -> None:
 
 
 class HarnessClient(InferenceClient):
-    def __init__(self, remote_host: str = "localhost", remote_port: int = 8000, timeout: float = 180) -> None:
+    def __init__(self, remote_host: str = "localhost", remote_port: int = 8000, timeout: float = 2400) -> None:
         super().__init__()
         self.timeout = timeout
         # Connect once, and never reconnect/resend a decision automatically.

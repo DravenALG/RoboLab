@@ -1,4 +1,4 @@
-"""Evaluate the visual EEF harness once per task with RoboLab absolute IK."""
+"""Evaluate independent, sequential visual EEF harness runs with RoboLab absolute IK."""
 
 import argparse
 from pathlib import Path
@@ -19,8 +19,8 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--remote-host", default="localhost")
     parser.add_argument("--remote-port", type=int, default=8000)
-    parser.add_argument("--request-timeout", type=float, default=180,
-                        help="WebSocket response timeout; must exceed the model API timeout.")
+    parser.add_argument("--request-timeout", type=float, default=2400,
+                        help="WebSocket response timeout; allow time for all API attempts and retry delays.")
     add_common_eval_args(parser)
     AppLauncher.add_app_launcher_args(parser)
     args = parser.parse_args()
