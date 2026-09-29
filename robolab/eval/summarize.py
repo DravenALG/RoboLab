@@ -131,6 +131,7 @@ def build_run_summary(
     enable_subtask_progress: bool,
     instruction_type: str | None = None,
     timing: dict | None = None,
+    gpu_usage: dict | None = None,
     task_name: str | None = None,
     extra_fields: dict | None = None,
     final_score: float | None = None,
@@ -165,6 +166,8 @@ def build_run_summary(
         summary["instruction_type"] = instruction_type
     if timing is not None:
         summary["timing"] = timing
+    if gpu_usage is not None:
+        summary["gpu_usage"] = gpu_usage
 
     if enable_subtask_progress:
         # Score: HDF5 subtask/score[final_step] is canonical (matches
@@ -219,6 +222,7 @@ def summarize_run(
     episode_results_file: str,
     enable_subtask_progress: bool = False,
     timing: dict | None = None,
+    gpu_usage: dict | None = None,
     instruction_type: str | None = None,
     task_name: str | None = None,
     extra_fields: dict | None = None,
@@ -265,6 +269,8 @@ def summarize_run(
             "final_step": r.get("step"),
             "events": events,
         }
+        if gpu_usage is not None:
+            log_obj["gpu_usage"] = gpu_usage
         log_file = os.path.join(scene_output_dir, f"log_{run_idx}_env{eid}.json")
         dump_results_to_file(log_file, log_obj, append=False)
         per_env_events[eid] = _tally_events(events)
@@ -296,6 +302,7 @@ def summarize_run(
             enable_subtask_progress=enable_subtask_progress,
             instruction_type=instruction_type,
             timing=timing,
+            gpu_usage=gpu_usage,
             task_name=task_name,
             extra_fields=extra_fields,
             final_score=final_score,

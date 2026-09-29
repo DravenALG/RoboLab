@@ -160,6 +160,7 @@ def run_evaluation(
     from robolab.core.utils.adaptive_sampling import count_task_episodes, should_continue_sampling
     from robolab.core.utils.print_utils import print_experiment_summary
     from robolab.eval.episode import run_episode
+    from robolab.eval.gpu_usage import GpuUsageMonitor
     from robolab.eval.summarize import summarize_run
 
     if args.output_folder_name is not None:
@@ -267,16 +268,21 @@ def run_evaluation(
                 f"(run {run_idx}, {num_envs} envs)\033[0m"
             )
 
-            env_results, msgs, timing = run_episode(
-                env=env,
-                env_cfg=env_cfg,
-                episode=run_idx,
-                client=client,
-                save_videos=save_videos,
-                video_mode=args.video_mode,
-                headless=args.headless,
-                enable_gt_state=args.enable_gt_state,
-            )
+            gpu_monitor = GpuUsageMonitor(args.device)
+            try:
+                with gpu_monitor:
+                    env_results, msgs, timing = run_episode(
+                        env=env,
+                        env_cfg=env_cfg,
+                        episode=run_idx,
+                        client=client,
+                        save_videos=save_videos,
+                        video_mode=args.video_mode,
+                        headless=args.headless,
+                        enable_gt_state=args.enable_gt_state,
+                    )
+            finally:
+                print(f"[RoboLab] GPU usage for {run_name}: {gpu_monitor.data}", flush=True)
 
             episode_results = summarize_run(
                 env_results=env_results,
@@ -293,6 +299,7 @@ def run_evaluation(
                 episode_results_file=episode_results_file,
                 enable_subtask_progress=robolab.constants.ENABLE_SUBTASK_PROGRESS_CHECKING,
                 timing=timing,
+                gpu_usage=gpu_monitor.data,
                 instruction_type=args.instruction_type,
             )
 

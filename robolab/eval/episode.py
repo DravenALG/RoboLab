@@ -111,7 +111,7 @@ def run_episode(
 
     subtask_status = []
 
-    client.begin_episode(episode)
+    client.begin_episode(episode, max_steps=max_steps, control_dt=env_cfg.sim.dt * env_cfg.decimation)
 
     # Set up per-run HDF5 file and per-env demo indices
     if env.recorder_manager is not None and hasattr(env.recorder_manager, 'set_hdf5_file'):
@@ -151,6 +151,7 @@ def run_episode(
     kit_app = omni.kit.app.get_app()
 
     actual_steps = 0
+    end_reason = "execution_error"
     try:
         for step in tqdm(range(max_steps)):
 
@@ -197,6 +198,7 @@ def run_episode(
 
             timer.start("env_step")
             obs, reward, term, trunc, info = env.step(actions)
+            actual_steps += 1
             timer.stop("env_step")
 
             # Collect per-env subtask info (list of dicts, one per env)
@@ -217,12 +219,17 @@ def run_episode(
                         video_writers_viewport[env_id].write(frame_vp)
                 timer.stop("video_write")
 
-            actual_steps += 1
-
             # RobolabEnv freezes terminated envs and exports recordings automatically
             if env.all_terminated:
+                end_reason = "native_terminal"
                 break
+        else:
+            end_reason = "time_limit"
     finally:
+        try:
+            client.end_episode(obs, actual_steps=actual_steps, reason=end_reason)
+        except Exception:
+            logger.exception("Failed to notify client of episode end")
         for vw in video_writers_obs + video_writers_viewport:
             try:
                 vw.release()

@@ -231,8 +231,9 @@ class VLANeXtDroidClient(InferenceClient):
             histories[env_id] = deque(maxlen=max(1, self.history_len))
         return histories[env_id]
 
-    def begin_episode(self, episode_idx: int) -> None:
-        super().begin_episode(episode_idx)
+    def begin_episode(self, episode_idx: int, *, max_steps: int | None = None,
+                      control_dt: float | None = None) -> None:
+        super().begin_episode(episode_idx, max_steps=max_steps, control_dt=control_dt)
         self.reset()
 
     def reset(self, *, env_id: int | None = None) -> None:

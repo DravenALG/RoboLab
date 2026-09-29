@@ -20,7 +20,7 @@ def main() -> None:
     parser.add_argument("--remote-host", default="localhost")
     parser.add_argument("--remote-port", type=int, default=8000)
     parser.add_argument("--request-timeout", type=float, default=2400,
-                        help="WebSocket response timeout; allow time for all API attempts and retry delays.")
+                        help="Time to receive the next action or episode-end acknowledgement; allow for model retries.")
     add_common_eval_args(parser)
     AppLauncher.add_app_launcher_args(parser)
     args = parser.parse_args()
