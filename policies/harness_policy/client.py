@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from contextlib import ExitStack
+import math
 from uuid import uuid4
 
 import numpy as np
@@ -45,29 +46,68 @@ class HarnessClient(InferenceClient):
         self._packer = msgpack_numpy.Packer()
         try:
             self.metadata = msgpack_numpy.unpackb(self._connection.recv(timeout=timeout))
+            if self.metadata.get("protocol_version") != 2:
+                raise ValueError("Harness protocol version 2 is required; update client and server together")
             if self.metadata.get("action_representation") != ACTION_REPRESENTATION:
                 raise ValueError("Server must provide RoboLab base_link absolute quaternion actions")
             if self.metadata.get("action_dim") != 8:
                 raise ValueError("Server action_dim must be 8")
-            self.open_loop_horizon = int(self.metadata["action_horizon"])
             self.image_size = int(self.metadata["image_size"])
-            if self.open_loop_horizon < 1 or self.image_size < 1:
-                raise ValueError("Server horizon and image_size must be positive")
+            if self.image_size < 1:
+                raise ValueError("Server image_size must be positive")
         except Exception:
             self.close()
             raise
         self._episode_id = None
         self._decision_step = 0
+        self._control_step = 0
+        self._ended = True
 
-    def begin_episode(self, episode_idx: int) -> None:
-        super().begin_episode(episode_idx)
+    def begin_episode(self, episode_idx: int, *, max_steps: int | None = None,
+                      control_dt: float | None = None) -> None:
+        if isinstance(max_steps, bool) or not isinstance(max_steps, int) or max_steps < 1:
+            raise ValueError("Harness episodes require a positive integer max_steps")
+        if control_dt is None or not math.isfinite(control_dt) or control_dt <= 0:
+            raise ValueError("Harness episodes require positive finite control_dt")
+        super().begin_episode(episode_idx, max_steps=max_steps, control_dt=control_dt)
         self.reset()
+        self._max_steps, self._control_dt = max_steps, control_dt
         self._episode_id = f"{uuid4().hex}-{episode_idx}"
+        self._ended = False
+
+    def end_episode(self, observation, *, actual_steps: int, reason: str) -> None:
+        if self._episode_id is None or self._ended:
+            return
+        try:
+            # No server-side episode exists before the first successful inference.
+            if self._decision_step:
+                self._query_server({
+                    "type": "end_episode", "episode_id": self._episode_id, "env_id": 0,
+                    "decision_step": self._decision_step, "control_step": actual_steps,
+                    "observation": self._extract_observation(observation), "reason": reason,
+                })
+        finally:
+            self._ended = True
+            self._chunks.clear()
+            self._counters.clear()
 
     def reset(self, *, env_id: int | None = None) -> None:
+        if self._episode_id is not None and not self._ended:
+            raise RuntimeError("end_episode must be called before reset")
         super().reset(env_id=env_id)
         self._episode_id = None
         self._decision_step = 0
+        self._control_step = 0
+
+    def _needs_refresh(self, env_id: int) -> bool:
+        return env_id not in self._chunks or self._counters[env_id] >= len(self._chunks[env_id])
+
+    def _next_action(self, env_id: int) -> np.ndarray:
+        if self._ended or self._control_step >= self._max_steps:
+            raise RuntimeError("Episode has ended or exhausted its control steps")
+        action = super()._next_action(env_id)
+        self._control_step += 1
+        return action
 
     def _extract_observation(self, raw_obs, *, env_id: int = 0) -> dict:
         if env_id != 0:
@@ -89,9 +129,13 @@ class HarnessClient(InferenceClient):
         if self._episode_id is None:
             raise RuntimeError("begin_episode must be called before inference")
         return {
+            "type": "infer",
             "episode_id": self._episode_id,
             "env_id": 0,
             "decision_step": self._decision_step,
+            "control_step": self._control_step,
+            "max_steps": self._max_steps,
+            "control_dt": self._control_dt,
             "instruction": instruction,
             "observation": extracted_obs,
         }
@@ -105,7 +149,9 @@ class HarnessClient(InferenceClient):
 
     def _unpack_response(self, response: dict) -> np.ndarray:
         actions = np.asarray(response["actions"], dtype=np.float32)
-        if actions.shape != (self.open_loop_horizon, 8) or not np.isfinite(actions).all():
+        if (actions.ndim != 2 or actions.shape[1] != 8
+                or not 1 <= len(actions) <= self._max_steps - self._control_step
+                or not np.isfinite(actions).all()):
             raise ValueError("Invalid harness action chunk")
         if not np.allclose(np.linalg.norm(actions[:, 3:7], axis=1), 1, atol=1e-4):
             raise ValueError("Harness action quaternions must be normalized")

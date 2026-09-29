@@ -45,7 +45,8 @@ class InferenceClient(ABC):
         # Set by begin_episode(); see below.
         self._eval_episode_idx: int = 0
 
-    def begin_episode(self, episode_idx: int) -> None:
+    def begin_episode(self, episode_idx: int, *, max_steps: int | None = None,
+                      control_dt: float | None = None) -> None:
         """Notify the client that a new episode is starting.
 
         Called by ``run_episode`` before the first inference of each episode.
@@ -56,6 +57,13 @@ class InferenceClient(ABC):
         ``super().begin_episode(episode_idx)``.
         """
         self._eval_episode_idx = episode_idx
+
+    def end_episode(self, observation: Any, *, actual_steps: int, reason: str) -> None:
+        """Notify policies of the final observation before reset clears their state.
+
+        reason is native_terminal, time_limit, or execution_error. This hook
+        carries no scores or evaluator diagnostics. Default: no-op.
+        """
 
 
     def infer(self, obs: Any, instruction: str, *, env_id: int = 0) -> dict:
