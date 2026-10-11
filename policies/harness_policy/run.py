@@ -16,7 +16,10 @@ from robolab.eval.runner import add_common_eval_args, run_evaluation
 def main() -> None:
     from isaaclab.app import AppLauncher
 
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = argparse.ArgumentParser(
+        description=__doc__,
+        epilog="For the harness, --output-folder-name must name a new output directory; resume is disabled.",
+    )
     parser.add_argument("--remote-host", default="localhost")
     parser.add_argument("--remote-port", type=int, default=8000)
     parser.add_argument("--request-timeout", type=float, default=2400,

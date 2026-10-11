@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from contextlib import ExitStack
 import math
+from pathlib import Path
 from uuid import uuid4
 
 import numpy as np
@@ -11,6 +12,7 @@ from openpi_client import msgpack_numpy
 from PIL import Image
 from websockets.sync.client import connect
 
+from robolab.constants import PACKAGE_DIR
 from robolab.eval.base_client import InferenceClient
 
 
@@ -30,7 +32,14 @@ def validate_eval_args(args) -> None:
     if not args.enable_subtask:
         raise ValueError("Keep the benchmark's subtask evaluation enabled")
     if args.output_folder_name is not None:
-        raise ValueError("The minimal harness requires a fresh output directory; resume is disabled")
+        if not args.output_folder_name.strip():
+            raise ValueError("--output-folder-name must not be empty")
+        output_dir = Path(PACKAGE_DIR) / "output" / args.output_folder_name
+        if output_dir.exists() or output_dir.is_symlink():
+            raise ValueError(
+                f"Output path already exists: {output_dir}. "
+                "Choose a new --output-folder-name; harness resume is disabled."
+            )
 
 
 class HarnessClient(InferenceClient):
