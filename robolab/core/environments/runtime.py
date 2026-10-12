@@ -12,6 +12,7 @@ import json
 import logging
 import math
 import os
+from copy import deepcopy
 
 import carb
 import gymnasium as gym
@@ -74,6 +75,15 @@ def check_scene_valid(env: ManagerBasedEnv) -> bool:
     return True
 
 
+def _apply_episode_length_scale(env_cfg: ManagerBasedEnvCfg, scale: float) -> None:
+    if scale == 1.0:
+        return
+    duration = env_cfg.episode_length_s * scale
+    if not math.isfinite(duration) or duration <= 0:
+        raise ValueError("Scaled episode_length_s must be finite and positive")
+    env_cfg.episode_length_s = duration
+
+
 def create_env(scene: str | ManagerBasedEnvCfg,
                device="cuda:0",
                seed=0,
@@ -87,7 +97,7 @@ def create_env(scene: str | ManagerBasedEnvCfg,
                policy=None,
                renderer="realtime",
                rendering_mode=None,
-               episode_length_s: float | None = None,
+               episode_length_scale: float = 1.0,
     ):
     """
     Creates and initializes a gym environment for the specified scene. Supported types: str, ManagerBasedEnvCfg.
@@ -123,7 +133,8 @@ def create_env(scene: str | ManagerBasedEnvCfg,
         env, env_cfg = create_env(scene="BananaEnv", events=events)
 
     Args:
-        scene (str, ManagerBasedEnvCfg): The scene name, or environment configuration
+        scene (str, ManagerBasedEnvCfg): The scene name, or environment configuration.
+            Configuration objects are copied before applying runtime overrides.
         device: The device to run the environment on (e.g., 'cuda', 'cpu')
         num_envs (int, optional): Number of environments to spawn. Defaults to 1.
         use_fabric (bool, optional): Whether to use fabric for physics simulation. Defaults to True.
@@ -139,19 +150,19 @@ def create_env(scene: str | ManagerBasedEnvCfg,
             "pathtracing" (PathTracing). Default preserves IsaacLab behavior.
         rendering_mode: Realtime quality preset ("performance"/"balanced"/"quality")
             or None to leave IsaacLab's default ("balanced").
-        episode_length_s: Maximum simulated seconds per episode. Must be finite
-            and positive; None preserves the task's configured duration.
+        episode_length_scale: Multiplier for this task's configured episode duration.
+            Must be finite and positive; 1.0 preserves the original duration.
+            IsaacLab rounds the resulting control-step limit up to a whole step.
 
     Raises:
-        ValueError: If episode_length_s is invalid, the scene type is not
+        ValueError: If episode_length_scale is invalid, the scene type is not
             supported, or environment creation fails.
 
     Returns:
         tuple: (env, env_cfg) - The created environment instance and its configuration
     """
-    if episode_length_s is not None:
-        if not math.isfinite(episode_length_s) or episode_length_s <= 0:
-            raise ValueError("episode_length_s must be finite and positive")
+    if not math.isfinite(episode_length_scale) or episode_length_scale <= 0:
+        raise ValueError("episode_length_scale must be finite and positive")
 
     env = None
 
@@ -174,8 +185,7 @@ def create_env(scene: str | ManagerBasedEnvCfg,
                 lookat=lookat,
             )
 
-            if episode_length_s is not None:
-                env_cfg.episode_length_s = episode_length_s
+            _apply_episode_length_scale(env_cfg, episode_length_scale)
 
             env_cfg._instruction_variants = env_cfg.instruction
             env_cfg.instruction = resolve_instruction(env_cfg.instruction, instruction_type)
@@ -208,10 +218,10 @@ def create_env(scene: str | ManagerBasedEnvCfg,
         omni.usd.get_context().new_stage()
         # reset the rtx sensors carb setting to False
         carb.settings.get_settings().set_bool("/isaaclab/render/rtx_sensors", False)
-        env_cfg = scene
-
-        if episode_length_s is not None:
-            env_cfg.episode_length_s = episode_length_s
+        # configclass.copy() reconstructs the dataclass and reruns __post_init__,
+        # which can reset caller overrides and omit dynamically added fields.
+        env_cfg = deepcopy(scene)
+        _apply_episode_length_scale(env_cfg, episode_length_scale)
 
         env_cfg._instruction_variants = env_cfg.instruction
         env_cfg.instruction = resolve_instruction(env_cfg.instruction, instruction_type)

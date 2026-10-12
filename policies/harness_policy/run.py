@@ -1,4 +1,4 @@
-"""Evaluate independent, sequential visual EEF harness runs with RoboLab absolute IK."""
+"""Evaluate independent harness runs with negotiated EEF or hybrid EEF/joint control."""
 
 import argparse
 from pathlib import Path
@@ -39,15 +39,18 @@ def main() -> None:
     try:
         from robolab.registrations.droid.auto_env_registrations_abs_ik import auto_register_droid_abs_ik_envs
 
-        auto_register_droid_abs_ik_envs(task_dirs=args.task_dirs, task=args.task)
+        # Negotiate the controller before the runner constructs any environment.
+        client = HarnessClient(args.remote_host, args.remote_port, args.request_timeout)
+        clients.append(client)
+        actions_cfg = None
+        if client.hybrid:
+            from policies.harness_policy.hybrid_actions import DroidHarnessActionCfg
+            actions_cfg = DroidHarnessActionCfg()
+        auto_register_droid_abs_ik_envs(task_dirs=args.task_dirs, task=args.task, actions_cfg=actions_cfg)
 
         def make_client(eval_args):
-            # The shared runner constructs one client per task but doesn't close
-            # its connections; close the preceding task's client here.
-            if clients:
-                clients.pop().close()
-            client = HarnessClient(eval_args.remote_host, eval_args.remote_port, eval_args.request_timeout)
-            clients.append(client)
+            # Episode hooks reset state and create independent Codex sessions;
+            # reuse the negotiated connection across tasks.
             return client
 
         run_evaluation(args, policy="harness", client_factory=make_client)

@@ -1,4 +1,4 @@
-"""Thin RoboLab adapter for the visual EEF harness; no privileged observations."""
+"""RoboLab adapter for EEF or hybrid EEF/joint harness actions and public observations."""
 
 from __future__ import annotations
 
@@ -8,7 +8,7 @@ from pathlib import Path
 from uuid import uuid4
 
 import numpy as np
-from openpi_client import msgpack_numpy
+from openpi_client import image_tools, msgpack_numpy
 from PIL import Image
 from websockets.sync.client import connect
 
@@ -17,6 +17,7 @@ from robolab.eval.base_client import InferenceClient
 
 
 ACTION_REPRESENTATION = "robolab_base_link_absolute_xyz_quat_wxyz_gripper"
+HYBRID_ACTION_REPRESENTATION = "robolab_mode_absolute_xyz_quat_wxyz_or_jointpos_gripper"
 
 
 def validate_eval_args(args) -> None:
@@ -55,12 +56,16 @@ class HarnessClient(InferenceClient):
         self._packer = msgpack_numpy.Packer()
         try:
             self.metadata = msgpack_numpy.unpackb(self._connection.recv(timeout=timeout))
-            if self.metadata.get("protocol_version") != 2:
-                raise ValueError("Harness protocol version 2 is required; update client and server together")
-            if self.metadata.get("action_representation") != ACTION_REPRESENTATION:
-                raise ValueError("Server must provide RoboLab base_link absolute quaternion actions")
-            if self.metadata.get("action_dim") != 8:
-                raise ValueError("Server action_dim must be 8")
+            version = self.metadata.get("protocol_version")
+            if version not in (2, 3):
+                raise ValueError("Harness protocol version 2 or 3 is required; update client and server together")
+            self.hybrid = version == 3
+            representation = HYBRID_ACTION_REPRESENTATION if self.hybrid else ACTION_REPRESENTATION
+            self.action_dim = 9 if self.hybrid else 8
+            if self.metadata.get("action_representation") != representation:
+                raise ValueError("Server action representation does not match the harness protocol")
+            if self.metadata.get("action_dim") != self.action_dim:
+                raise ValueError(f"Server action_dim must be {self.action_dim}")
             self.image_size = int(self.metadata["image_size"])
             if self.image_size < 1:
                 raise ValueError("Server image_size must be positive")
@@ -128,8 +133,13 @@ class HarnessClient(InferenceClient):
             "joint_positions": self._to_numpy(proprio["arm_joint_pos"], env_id),
             "gripper": float(self._to_numpy(proprio["gripper_pos"], env_id).reshape(-1)[0]),
         }
+        if self.hybrid:
+            observation["vla_images"] = {}
         for output_name, camera in (("exterior_image", "over_shoulder_left_camera"), ("wrist_image", "wrist_cam")):
-            image = Image.fromarray(self._to_numpy(raw_obs["image_obs"][camera], env_id))
+            raw_image = self._to_numpy(raw_obs["image_obs"][camera], env_id)
+            if self.hybrid:
+                observation["vla_images"][output_name] = image_tools.resize_with_pad(raw_image, 224, 224)
+            image = Image.fromarray(raw_image)
             image.thumbnail((self.image_size, self.image_size), Image.Resampling.LANCZOS)
             observation[output_name] = np.asarray(image)
         return observation
@@ -158,13 +168,19 @@ class HarnessClient(InferenceClient):
 
     def _unpack_response(self, response: dict) -> np.ndarray:
         actions = np.asarray(response["actions"], dtype=np.float32)
-        if (actions.ndim != 2 or actions.shape[1] != 8
+        if (actions.ndim != 2 or actions.shape[1] != self.action_dim
                 or not 1 <= len(actions) <= self._max_steps - self._control_step
                 or not np.isfinite(actions).all()):
             raise ValueError("Invalid harness action chunk")
-        if not np.allclose(np.linalg.norm(actions[:, 3:7], axis=1), 1, atol=1e-4):
+        if self.hybrid:
+            if not np.isin(actions[:, 0], [0, 1]).all() or not np.all(actions[:, 0] == actions[0, 0]):
+                raise ValueError("A harness chunk must contain one valid control mode (0=EEF, 1=joints)")
+            poses = actions[actions[:, 0] == 0, 1:]
+        else:
+            poses = actions
+        if not np.allclose(np.linalg.norm(poses[:, 3:7], axis=1), 1, atol=1e-4):
             raise ValueError("Harness action quaternions must be normalized")
-        if not np.isin(actions[:, 7], [0, 1]).all():
+        if not np.isin(actions[:, -1], [0, 1]).all():
             raise ValueError("Harness gripper actions must be binary")
         self._decision_step += 1
         return actions
