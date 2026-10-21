@@ -280,6 +280,8 @@ def run_evaluation(
                 enable_gt_state=args.enable_gt_state,
             )
 
+            metadata_hook = getattr(client, "episode_result_metadata", None)
+            result_metadata = metadata_hook() if callable(metadata_hook) else None
             episode_results = summarize_run(
                 env_results=env_results,
                 msgs=msgs,
@@ -296,6 +298,7 @@ def run_evaluation(
                 enable_subtask_progress=robolab.constants.ENABLE_SUBTASK_PROGRESS_CHECKING,
                 timing=timing,
                 instruction_type=args.instruction_type,
+                extra_fields=result_metadata,
             )
 
             env.reset_eval_state()

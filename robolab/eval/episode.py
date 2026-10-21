@@ -56,6 +56,7 @@ from robolab.core.observations.observation_utils import unpack_image_obs, unpack
 from robolab.core.utils.video_utils import VideoWriter
 from robolab.core.world.world_state import get_world
 from robolab.eval.base_client import InferenceClient
+from robolab.eval.errors import PolicyExecutionError
 
 
 def run_episode(
@@ -152,6 +153,7 @@ def run_episode(
 
     actual_steps = 0
     end_reason = "execution_error"
+    policy_failures = {}
     try:
         for step in tqdm(range(max_steps)):
 
@@ -179,15 +181,23 @@ def run_episode(
             # loop, so other policies behave exactly as before.
             actions = torch.zeros(env.num_envs, action_dim, device=env.device)
             last_viz = None
-            rets = client.infer_batch(
-                obs, instruction, env_ids=list(env.active_env_ids)
-            )
-            for env_id in sorted(rets):
-                ret = rets[env_id]
-                actions[env_id] = torch.tensor(ret["action"], device=env.device)
-                if env_id == 0 or last_viz is None:
-                    last_viz = ret.get("viz")
-            timer.stop("policy_inference")
+            try:
+                rets = client.infer_batch(
+                    obs, instruction, env_ids=list(env.active_env_ids)
+                )
+                for env_id in sorted(rets):
+                    ret = rets[env_id]
+                    actions[env_id] = torch.tensor(ret["action"], device=env.device)
+                    if env_id == 0 or last_viz is None:
+                        last_viz = ret.get("viz")
+            except PolicyExecutionError as error:
+                timer.stop("policy_inference")
+                policy_failures = {eid: error.as_record() for eid in env.active_env_ids}
+                env.fail_active_episodes(actual_steps)
+                logger.warning("Policy failed at step %d: %s", actual_steps, error)
+                break
+            finally:
+                timer.stop("policy_inference")
 
             if not headless and last_viz is not None:
                 cv2.imshow(f"{instruction}", cv2.cvtColor(last_viz, cv2.COLOR_RGB2BGR))
@@ -241,4 +251,8 @@ def run_episode(
             logger.exception("Failed to reset client after episode")
 
     timing = timer.to_dict(actual_steps)
-    return env.get_env_results(), subtask_status, timing
+    env_results = env.get_env_results()
+    if policy_failures:
+        for result in env_results:
+            result.update(policy_failures.get(result["env_id"], {}))
+    return env_results, subtask_status, timing

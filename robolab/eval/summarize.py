@@ -165,6 +165,9 @@ def build_run_summary(
         summary["instruction_type"] = instruction_type
     if timing is not None:
         summary["timing"] = timing
+    for key in ("error_kind", "error_type", "error"):
+        if key in env_result:
+            summary[key] = env_result[key]
 
     if enable_subtask_progress:
         # Score: HDF5 subtask/score[final_step] is canonical (matches
@@ -265,6 +268,9 @@ def summarize_run(
             "final_step": r.get("step"),
             "events": events,
         }
+        for key in ("error_kind", "error_type", "error"):
+            if key in r:
+                log_obj[key] = r[key]
         log_file = os.path.join(scene_output_dir, f"log_{run_idx}_env{eid}.json")
         dump_results_to_file(log_file, log_obj, append=False)
         per_env_events[eid] = _tally_events(events)

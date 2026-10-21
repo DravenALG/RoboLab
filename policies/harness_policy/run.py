@@ -10,6 +10,8 @@ import cv2  # noqa: F401 -- must be imported before IsaacLab
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from policies.harness_policy.client import HarnessClient, validate_eval_args
+from policies.harness_policy.resume import prepare_output
+from robolab.constants import PACKAGE_DIR
 from robolab.eval.runner import add_common_eval_args, run_evaluation
 
 
@@ -18,8 +20,11 @@ def main() -> None:
 
     parser = argparse.ArgumentParser(
         description=__doc__,
-        epilog="For the harness, --output-folder-name must name a new output directory; resume is disabled.",
+        epilog="Use --resume with an existing output directory and the original evaluation settings. "
+               "Completed episodes (including failures) are skipped; interrupted episodes restart.",
     )
+    parser.add_argument("--resume", action="store_true",
+                        help="Continue --output-folder-name; --num-runs remains the target total per task.")
     parser.add_argument("--remote-host", default="localhost")
     parser.add_argument("--remote-port", type=int, default=8000)
     parser.add_argument("--request-timeout", type=float, default=2400,
@@ -47,6 +52,20 @@ def main() -> None:
             from policies.harness_policy.hybrid_actions import DroidHarnessActionCfg
             actions_cfg = DroidHarnessActionCfg()
         auto_register_droid_abs_ik_envs(task_dirs=args.task_dirs, task=args.task, actions_cfg=actions_cfg)
+
+        if args.resume:
+            from robolab.core.environments.factory import get_envs
+
+            if args.task:
+                tasks = get_envs(task=args.task)
+            elif args.tag:
+                tasks = get_envs(tag=args.tag)
+            else:
+                tasks = get_envs()
+            archive = prepare_output(Path(PACKAGE_DIR) / "output" / args.output_folder_name,
+                                     tasks, args.num_runs)
+            if archive is not None:
+                print(f"Archived interrupted output: {archive}")
 
         def make_client(eval_args):
             # Episode hooks reset state and create independent Codex sessions;

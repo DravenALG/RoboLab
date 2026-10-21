@@ -65,6 +65,13 @@ class InferenceClient(ABC):
         carries no scores or evaluator diagnostics. Default: no-op.
         """
 
+    def episode_result_metadata(self) -> dict:
+        """Extra fields for the just-finished result, available after reset.
+
+        This is an offline logging hook; its contents are never sent to the policy.
+        """
+        return {}
+
 
     def infer(self, obs: Any, instruction: str, *, env_id: int = 0) -> dict:
         """Return ``{"action": np.ndarray, "viz": np.ndarray | None}``.

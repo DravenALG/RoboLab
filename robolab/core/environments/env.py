@@ -140,6 +140,26 @@ class RobolabEnv(ManagerBasedRLEnv):
             })
         return results
 
+    def fail_active_episodes(self, actual_steps: int) -> None:
+        """Commit a policy failure without stepping or fabricating task events.
+
+        An invalid policy output can occur before the first action. Finalize
+        even those empty recordings, retaining any already terminated envs.
+        """
+        for eid in self.active_env_ids:
+            self._frozen_envs[eid] = True
+            self._env_results[eid] = False
+            self._env_term_step[eid] = actual_steps
+            if self.recorder_manager is not None:
+                try:
+                    self.recorder_manager.set_success_to_episodes(
+                        [eid], torch.zeros((1, 1), dtype=torch.bool, device=self.device),
+                    )
+                    self.recorder_manager.export_episodes(env_ids=[eid])
+                except Exception:
+                    # A recording failure must not resample a failed policy.
+                    logger.exception("Failed to export policy-failure recording for env_id=%d", eid)
+
     def reset_eval_state(self):
         """Reset frozen state for next episode batch."""
         self._frozen_envs[:] = False

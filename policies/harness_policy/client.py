@@ -5,15 +5,19 @@ from __future__ import annotations
 from contextlib import ExitStack
 import math
 from pathlib import Path
+import time
 from uuid import uuid4
 
 import numpy as np
 from openpi_client import image_tools, msgpack_numpy
 from PIL import Image
 from websockets.sync.client import connect
+from websockets.exceptions import ConnectionClosed
 
 from robolab.constants import PACKAGE_DIR
 from robolab.eval.base_client import InferenceClient
+from robolab.eval.errors import PolicyExecutionError
+from policies.harness_policy.resume import inspect_output
 
 
 ACTION_REPRESENTATION = "robolab_base_link_absolute_xyz_quat_wxyz_gripper"
@@ -32,14 +36,22 @@ def validate_eval_args(args) -> None:
         raise ValueError("Ground-truth input is disabled for the visual harness")
     if not args.enable_subtask:
         raise ValueError("Keep the benchmark's subtask evaluation enabled")
+    resume = getattr(args, "resume", False)
+    if resume and args.output_folder_name is None:
+        raise ValueError("--resume requires an explicit --output-folder-name")
     if args.output_folder_name is not None:
         if not args.output_folder_name.strip():
             raise ValueError("--output-folder-name must not be empty")
         output_dir = Path(PACKAGE_DIR) / "output" / args.output_folder_name
-        if output_dir.exists() or output_dir.is_symlink():
+        if resume:
+            if not output_dir.is_dir() or output_dir.is_symlink():
+                raise ValueError(f"--resume requires an existing directory: {output_dir}")
+            progress = inspect_output(output_dir)
+            progress.pending(getattr(args, "task", None) or [], args.num_runs)
+        elif output_dir.exists() or output_dir.is_symlink():
             raise ValueError(
                 f"Output path already exists: {output_dir}. "
-                "Choose a new --output-folder-name; harness resume is disabled."
+                "Choose a new --output-folder-name or pass --resume; resume is disabled by default."
             )
 
 
@@ -47,19 +59,43 @@ class HarnessClient(InferenceClient):
     def __init__(self, remote_host: str = "localhost", remote_port: int = 8000, timeout: float = 2400) -> None:
         super().__init__()
         self.timeout = timeout
-        # Connect once, and never reconnect/resend a decision automatically.
-        self._resources = ExitStack()
-        self._connection = self._resources.enter_context(connect(
-            f"ws://{remote_host}:{remote_port}", compression=None, max_size=None,
-            open_timeout=10, proxy=None, ping_interval=None,
-        ))
+        self._url = f"ws://{remote_host}:{remote_port}"
         self._packer = msgpack_numpy.Packer()
+        self._episode_id = None
+        self._result_episode_id = None
+        self._decision_step = 0
+        self._control_step = 0
+        self._ended = True
+        self._reconnect = False
+        self._resources = ExitStack()
+        self._open_connection()
+
+    def _open_connection(self) -> None:
+        # Only a new episode may replace a deliberately discarded connection.
+        # Never reconnect/resend an interrupted decision.
+        previous = getattr(self, "metadata", None)
+        deadline = time.monotonic() + 10
         try:
-            self.metadata = msgpack_numpy.unpackb(self._connection.recv(timeout=timeout))
+            while True:
+                self._connection = self._resources.enter_context(connect(
+                    self._url, compression=None, max_size=None,
+                    open_timeout=10, proxy=None, ping_interval=None,
+                ))
+                try:
+                    self.metadata = msgpack_numpy.unpackb(self._connection.recv(timeout=self.timeout))
+                    break
+                except ConnectionClosed as error:
+                    self._resources.close()
+                    if not self._reconnect or error.rcvd is None or error.rcvd.code != 1013 or time.monotonic() >= deadline:
+                        raise
+                    time.sleep(0.05)  # Previous episode's server cleanup is finishing.
+            if previous is not None and self.metadata != previous:
+                raise ValueError("Harness metadata changed between episodes")
             version = self.metadata.get("protocol_version")
             if version not in (2, 3):
                 raise ValueError("Harness protocol version 2 or 3 is required; update client and server together")
             self.hybrid = version == 3
+            self.vla_enabled = self.metadata.get("vla_enabled", self.hybrid)
             representation = HYBRID_ACTION_REPRESENTATION if self.hybrid else ACTION_REPRESENTATION
             self.action_dim = 9 if self.hybrid else 8
             if self.metadata.get("action_representation") != representation:
@@ -72,10 +108,7 @@ class HarnessClient(InferenceClient):
         except Exception:
             self.close()
             raise
-        self._episode_id = None
-        self._decision_step = 0
-        self._control_step = 0
-        self._ended = True
+        self._reconnect = False
 
     def begin_episode(self, episode_idx: int, *, max_steps: int | None = None,
                       control_dt: float | None = None) -> None:
@@ -85,8 +118,11 @@ class HarnessClient(InferenceClient):
             raise ValueError("Harness episodes require positive finite control_dt")
         super().begin_episode(episode_idx, max_steps=max_steps, control_dt=control_dt)
         self.reset()
+        if self._reconnect:
+            self._open_connection()
         self._max_steps, self._control_dt = max_steps, control_dt
         self._episode_id = f"{uuid4().hex}-{episode_idx}"
+        self._result_episode_id = self._episode_id
         self._ended = False
 
     def end_episode(self, observation, *, actual_steps: int, reason: str) -> None:
@@ -104,6 +140,10 @@ class HarnessClient(InferenceClient):
             self._ended = True
             self._chunks.clear()
             self._counters.clear()
+
+    def episode_result_metadata(self) -> dict:
+        # run_episode resets action state before the runner commits its result.
+        return {"harness_episode_id": self._result_episode_id} if self._result_episode_id else {}
 
     def reset(self, *, env_id: int | None = None) -> None:
         if self._episode_id is not None and not self._ended:
@@ -133,11 +173,11 @@ class HarnessClient(InferenceClient):
             "joint_positions": self._to_numpy(proprio["arm_joint_pos"], env_id),
             "gripper": float(self._to_numpy(proprio["gripper_pos"], env_id).reshape(-1)[0]),
         }
-        if self.hybrid:
+        if self.vla_enabled:
             observation["vla_images"] = {}
         for output_name, camera in (("exterior_image", "over_shoulder_left_camera"), ("wrist_image", "wrist_cam")):
             raw_image = self._to_numpy(raw_obs["image_obs"][camera], env_id)
-            if self.hybrid:
+            if self.vla_enabled:
                 observation["vla_images"][output_name] = image_tools.resize_with_pad(raw_image, 224, 224)
             image = Image.fromarray(raw_image)
             image.thumbnail((self.image_size, self.image_size), Image.Resampling.LANCZOS)
@@ -164,9 +204,37 @@ class HarnessClient(InferenceClient):
         response = self._connection.recv(timeout=self.timeout)
         if isinstance(response, str):
             raise RuntimeError(f"Harness execution error (no retry):\n{response}")
-        return msgpack_numpy.unpackb(response)
+        try:
+            result = msgpack_numpy.unpackb(response)
+            if not isinstance(result, dict):
+                raise ValueError("Harness response must be an object")
+        except (ValueError, TypeError, KeyError, OverflowError) as error:
+            self._policy_failure(str(error), reconnect=True)
+        if "error" in result:
+            error = result["error"]
+            if (not isinstance(error, dict) or error.get("kind") != "policy_execution"
+                    or not isinstance(error.get("type"), str) or not isinstance(error.get("message"), str)
+                    or result.get("episode_id") != self._episode_id):
+                self._policy_failure("Invalid harness error response", reconnect=True)
+            self._policy_failure(error["message"], error_type=error["type"])
+        return result
+
+    def _policy_failure(self, message: str, *, error_type: str = "PolicyProtocolError", reconnect=False):
+        self._ended = True
+        self._chunks.clear()
+        self._counters.clear()
+        if reconnect:
+            self.close()
+            self._reconnect = True
+        raise PolicyExecutionError(message, error_type=error_type)
 
     def _unpack_response(self, response: dict) -> np.ndarray:
+        try:
+            return self._validate_response(response)
+        except (ValueError, TypeError, KeyError, OverflowError) as error:
+            self._policy_failure(str(error), reconnect=True)
+
+    def _validate_response(self, response: dict) -> np.ndarray:
         actions = np.asarray(response["actions"], dtype=np.float32)
         if (actions.ndim != 2 or actions.shape[1] != self.action_dim
                 or not 1 <= len(actions) <= self._max_steps - self._control_step
