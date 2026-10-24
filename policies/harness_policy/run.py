@@ -11,6 +11,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from policies.harness_policy.client import HarnessClient, validate_eval_args
 from policies.harness_policy.resume import prepare_output
+from policies.harness_policy.batch_resume import read_episode_plan
 from robolab.constants import PACKAGE_DIR
 from robolab.eval.runner import add_common_eval_args, run_evaluation
 
@@ -25,6 +26,7 @@ def main() -> None:
     )
     parser.add_argument("--resume", action="store_true",
                         help="Continue --output-folder-name; --num-runs remains the target total per task.")
+    parser.add_argument("--episode-plan", type=Path, help=argparse.SUPPRESS)
     parser.add_argument("--remote-host", default="localhost")
     parser.add_argument("--remote-port", type=int, default=8000)
     parser.add_argument("--request-timeout", type=float, default=2400,
@@ -34,9 +36,12 @@ def main() -> None:
     args = parser.parse_args()
     try:
         validate_eval_args(args)
+        selection = read_episode_plan(args.episode_plan, args.num_runs) if args.episode_plan else None
+        if selection is not None and (not args.task or not set(args.task) <= {t for t, _ in selection}):
+            raise ValueError("Selected tasks must be present in the episode plan")
         if args.request_timeout <= 0:
             raise ValueError("request-timeout must be positive")
-    except ValueError as error:
+    except (OSError, ValueError) as error:
         parser.error(str(error))
     args.enable_cameras = True
     simulation_app = AppLauncher(args).app
@@ -72,7 +77,7 @@ def main() -> None:
             # reuse the negotiated connection across tasks.
             return client
 
-        run_evaluation(args, policy="harness", client_factory=make_client)
+        run_evaluation(args, policy="harness", client_factory=make_client, episode_selection=selection)
     finally:
         for client in clients:
             client.close()

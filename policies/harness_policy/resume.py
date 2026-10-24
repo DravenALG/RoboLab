@@ -32,7 +32,7 @@ class Assignment:
     tasks: list[str]
 
 
-def read_assignments(run_dir: Path, gpus: list[int]) -> list[Assignment]:
+def read_assignments(run_dir: Path, gpus: list[int] | None) -> list[Assignment]:
     """Read the original mapping; extra, unused trailing GPUs are harmless."""
     _directory(run_dir)
     path = run_dir / "assignments.tsv"
@@ -62,7 +62,7 @@ def read_assignments(run_dir: Path, gpus: list[int]) -> list[Assignment]:
         raise ValueError(f"Empty or duplicate GPU assignments in {path}")
     if ports != list(range(ports[0], ports[0] + len(ports))):
         raise ValueError(f"Invalid original port order in {path}")
-    if gpus[:len(saved_gpus)] != saved_gpus:
+    if gpus is not None and gpus[:len(saved_gpus)] != saved_gpus:
         raise ValueError(f"--gpus must preserve the original worker GPUs and order: {saved_gpus}")
     return assignments
 

@@ -131,6 +131,7 @@ def run_evaluation(
     *,
     policy: str,
     client_factory: ClientFactory,
+    episode_selection: frozenset[tuple[str, int]] | None = None,
 ) -> None:
     """Drive the per-task evaluation loop.
 
@@ -146,7 +147,17 @@ def run_evaluation(
         client_factory: Callable that builds the :class:`InferenceClient` given
             ``args``. Called once per task; the client is reused across runs
             within a task.
+        episode_selection: Optional fixed-run subset, retaining original episode
+            indices. Results outside the subset are not copied into this output.
     """
+    if episode_selection is not None:
+        if args.num_envs != 1 or args.num_episodes_adaptive is not None:
+            raise ValueError("Episode selection requires one environment and fixed runs")
+        if any(not isinstance(task, str) or not task.isidentifier()
+               or type(run) is not int or not 0 <= run < args.num_runs
+               for task, run in episode_selection):
+            raise ValueError("Invalid selected episode")
+
     import os
 
     import robolab.constants
@@ -184,6 +195,10 @@ def run_evaluation(
         task_envs = get_envs()
         filter_str = "all"
 
+    if episode_selection is not None:
+        selected_tasks = {task for task, _ in episode_selection}
+        task_envs = [task for task in task_envs if task in selected_tasks]
+
     num_envs = args.num_envs
     num_runs = args.num_runs
     adaptive_max = args.num_episodes_adaptive
@@ -209,7 +224,11 @@ def run_evaluation(
         os.makedirs(scene_output_dir, exist_ok=True)
         set_output_dir(scene_output_dir)
 
-        if check_all_episodes_complete(
+        selected_complete = episode_selection is not None and all(
+            check_run_complete(episode_results, task_env, episode)
+            for task, episode in episode_selection if task == task_env
+        )
+        if selected_complete or check_all_episodes_complete(
             episode_results=episode_results, env_name=task_env, num_episodes=total_episodes
         ):
             print(f"\033[96m[RoboLab] Task `{task_env}` already done. Skipping.\033[0m")
@@ -250,6 +269,10 @@ def run_evaluation(
             else:
                 if run_idx >= num_runs:
                     break
+
+            if episode_selection is not None and (task_env, run_idx) not in episode_selection:
+                run_idx += 1
+                continue
 
             run_episode_ids = [run_idx * num_envs + eid for eid in range(num_envs)]
             if all(
