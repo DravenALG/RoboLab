@@ -98,6 +98,7 @@ class Batch:
     costs: dict[str, float]
     generations: list[Generation]
     persisted: bool = False
+    task_set: str = "full"
 
     @property
     def current(self) -> Generation:
@@ -118,7 +119,7 @@ class Batch:
         return found
 
     def document(self) -> dict:
-        return dict(schema_version=1, runs=self.runs, task_costs=self.costs,
+        return dict(schema_version=1, runs=self.runs, task_set=self.task_set, task_costs=self.costs,
                     generations=[dict(path=g.relative, gpus=g.gpus) for g in self.generations])
 
 
@@ -164,6 +165,9 @@ def read_batch(root: Path, runs: int | None = None) -> Batch:
     if runs is not None and runs != data["runs"]:
         raise ValueError(f"Keep the original --runs total ({data['runs']})")
     runs = data["runs"]
+    task_set = data.get("task_set", "full")
+    if task_set not in ("full", "sub"):
+        raise ValueError(f"Invalid task set in {path}")
     costs = data.get("task_costs")
     if (not isinstance(costs, dict) or not costs
             or any(not isinstance(t, str) or not t.isidentifier()
@@ -188,7 +192,7 @@ def read_batch(root: Path, runs: int | None = None) -> Batch:
             raise ValueError(f"Generation tasks do not match the batch catalog: {relative}")
         generations.append(generation)
         seen.add(relative)
-    return Batch(root, runs, costs, generations, persisted=True)
+    return Batch(root, runs, costs, generations, persisted=True, task_set=task_set)
 
 
 def worker_directories(root: Path) -> list[Path]:
@@ -217,9 +221,11 @@ class ResumePlan:
                 and (worker.selection is None or (task, run) in worker.selection)]
 
 
-def plan_resume(root: Path, gpus: list[int], runs: int) -> ResumePlan:
+def plan_resume(root: Path, gpus: list[int], runs: int, *, task_set: str | None = None) -> ResumePlan:
     validate_gpus(gpus)
     batch = read_batch(root, runs)
+    if task_set is not None and task_set != batch.task_set:
+        raise ValueError(f"Keep the original --set {batch.task_set}; received {task_set}")
     completed = batch.committed(artifacts=True)
     remaining = {t: [r for r in range(runs) if (t, r) not in completed] for t in batch.costs}
     remaining = {t: ids for t, ids in remaining.items() if ids}
@@ -277,9 +283,12 @@ def _atomic_json(path: Path, data: dict) -> None:
     _atomic_bytes(path, (json.dumps(data, indent=2, sort_keys=True) + "\n").encode())
 
 
-def initialize_batch(root: Path, gpus: list[int], runs: int, costs: dict[str, float]) -> None:
+def initialize_batch(root: Path, gpus: list[int], runs: int, costs: dict[str, float],
+                     *, task_set: str = "full") -> None:
     """Called with the run-directory lock held, after writing initial assignments."""
     validate_gpus(gpus)
+    if task_set not in ("full", "sub"):
+        raise ValueError("Task set must be full or sub")
     batch = read_batch(root, runs)
     if batch.persisted:
         raise ValueError("Batch manifest already exists")
@@ -288,6 +297,7 @@ def initialize_batch(root: Path, gpus: list[int], runs: int, costs: dict[str, fl
     if any(type(v) not in (int, float) or not math.isfinite(v) or v <= 0 for v in costs.values()):
         raise ValueError("Task costs must be finite and positive")
     batch.costs = costs
+    batch.task_set = task_set
     batch.current.gpus = list(gpus)
     _atomic_json(batch.root / MANIFEST, batch.document())
 
